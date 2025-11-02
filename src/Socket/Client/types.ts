@@ -13,7 +13,9 @@ export abstract class AbstractSocketClient extends EventEmitter {
 		public config: SocketConfig
 	) {
 		super()
-		this.setMaxListeners(0)
+		// Set max listeners to detect memory leaks from accumulating event listeners
+		// 50 is a reasonable limit for the abstract socket client
+		this.setMaxListeners(50)
 	}
 
 	abstract connect(): Promise<void>

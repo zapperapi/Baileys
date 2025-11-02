@@ -625,8 +625,13 @@ export const makeSocket = (config: SocketConfig) => {
 		})
 	}
 
-	const startKeepAliveRequest = () =>
-		(keepAliveReq = setInterval(() => {
+	const startKeepAliveRequest = () => {
+		// Clear existing interval to prevent multiple intervals running simultaneously
+		if (keepAliveReq) {
+			clearInterval(keepAliveReq)
+		}
+
+		keepAliveReq = setInterval(() => {
 			if (!lastDateRecv) {
 				lastDateRecv = new Date()
 			}
@@ -655,7 +660,9 @@ export const makeSocket = (config: SocketConfig) => {
 			} else {
 				logger.warn('keep alive called when WS not open')
 			}
-		}, keepAliveIntervalMs))
+		}, keepAliveIntervalMs)
+	}
+
 	/** i have no idea why this exists. pls enlighten me */
 	const sendPassiveIq = (tag: 'passive' | 'active') =>
 		query({

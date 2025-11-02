@@ -1387,8 +1387,57 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		])
 		const nodes: OfflineNode[] = []
 		let isProcessing = false
+		const MAX_OFFLINE_QUEUE_SIZE = 1000 // Maximum queue size before dropping old items
+		let droppedCount = 0
+		const droppedByType: Record<MessageType, number> = {
+			message: 0,
+			call: 0,
+			receipt: 0,
+			notification: 0
+		}
+		let totalEnqueued = 0
+		let totalProcessed = 0
 
 		const enqueue = (type: MessageType, node: BinaryNode) => {
+			totalEnqueued++
+
+			// If queue is full, remove oldest item (FIFO)
+			if (nodes.length >= MAX_OFFLINE_QUEUE_SIZE) {
+				const dropped = nodes.shift()
+				if (dropped) {
+					droppedCount++
+					droppedByType[dropped.type] = (droppedByType[dropped.type] || 0) + 1
+
+					// Log warning every 100 dropped items or if queue is consistently full
+					if (droppedCount % 100 === 0 || droppedCount === 1) {
+						logger.warn(
+							{
+								queueSize: nodes.length,
+								droppedCount,
+								droppedByType,
+								threshold: MAX_OFFLINE_QUEUE_SIZE
+							},
+							'Offline node queue is full, dropping oldest items'
+						)
+					}
+
+					// If we're dropping many items, log a more detailed warning
+					if (droppedCount % 500 === 0) {
+						logger.error(
+							{
+								queueSize: nodes.length,
+								droppedCount,
+								droppedByType,
+								totalEnqueued,
+								totalProcessed,
+								processingBacklog: totalEnqueued - totalProcessed
+							},
+							'Offline node queue experiencing significant backlog, many items being dropped'
+						)
+					}
+				}
+			}
+
 			nodes.push({ type, node })
 
 			if (isProcessing) {
@@ -1408,16 +1457,49 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 						continue
 					}
 
-					await nodeProcessor(node)
+					try {
+						await nodeProcessor(node)
+						totalProcessed++
+					} catch (error) {
+						// Error is already handled by nodeProcessor, but track it for metrics
+						logger.debug({ type, error }, 'Error processing offline node')
+					}
 				}
 
 				isProcessing = false
+
+				// Log periodic statistics if queue is getting backed up
+				if (nodes.length > MAX_OFFLINE_QUEUE_SIZE * 0.8) {
+					logger.debug(
+						{
+							currentQueueSize: nodes.length,
+							totalEnqueued,
+							totalProcessed,
+							droppedCount,
+							droppedByType,
+							backlog: totalEnqueued - totalProcessed - droppedCount
+						},
+						'Offline node queue statistics'
+					)
+				}
 			}
 
 			promise().catch(error => onUnexpectedError(error, 'processing offline nodes'))
 		}
 
-		return { enqueue }
+		const getStats = () => ({
+			currentQueueSize: nodes.length,
+			maxQueueSize: MAX_OFFLINE_QUEUE_SIZE,
+			totalEnqueued,
+			totalProcessed,
+			droppedCount,
+			droppedByType: { ...droppedByType },
+			isProcessing,
+			backlog: totalEnqueued - totalProcessed - droppedCount,
+			utilizationPercent: ((totalProcessed + droppedCount) / totalEnqueued) * 100 || 0
+		})
+
+		return { enqueue, getStats }
 	}
 
 	const offlineNodeProcessor = makeOfflineNodeProcessor()
@@ -1503,6 +1585,7 @@ export const makeMessagesRecvSocket = (config: SocketConfig) => {
 		rejectCall,
 		fetchMessageHistory,
 		requestPlaceholderResend,
-		messageRetryManager
+		messageRetryManager,
+		getOfflineQueueStats: offlineNodeProcessor.getStats
 	}
 }

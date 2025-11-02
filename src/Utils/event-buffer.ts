@@ -1,4 +1,5 @@
 import EventEmitter from 'events'
+import { LRUCache } from 'lru-cache'
 import type {
 	BaileysEvent,
 	BaileysEventEmitter,
@@ -32,6 +33,10 @@ const BUFFERABLE_EVENT = [
 ] as const
 
 type BufferableEvent = (typeof BUFFERABLE_EVENT)[number]
+
+// Constants for conditional update management
+const CONDITIONAL_UPDATE_TIMEOUT_MS = 5 * 60 * 1000 // 5 minutes for conditional updates
+const MAX_CONDITIONAL_UPDATES = 100 // Maximum number of pending conditional updates
 
 /**
  * A map that contains a list of all events that have been triggered
@@ -69,14 +74,28 @@ type BaileysBufferableEventEmitter = BaileysEventEmitter & {
  */
 export const makeEventBuffer = (logger: ILogger): BaileysBufferableEventEmitter => {
 	const ev = new EventEmitter()
-	const historyCache = new Set<string>()
+	// Set max listeners to detect memory leaks from accumulating event listeners
+	// 50 is a reasonable limit - if exceeded, Node.js will emit a warning
+	ev.setMaxListeners(50)
+
+	// Use LRU cache instead of Set to automatically evict least recently used items
+	const historyCache = new LRUCache<string, boolean>({
+		max: 5000, // Reduced from 10000 to use LRU eviction more frequently
+		ttl: 30 * 60 * 1000, // 30 minutes TTL for cache entries
+		updateAgeOnGet: false
+	})
 
 	let data = makeBufferData()
 	let isBuffering = false
 	let bufferTimeout: NodeJS.Timeout | null = null
+	let conditionalCleanupTimer: NodeJS.Timeout | null = null
 	let bufferCount = 0
-	const MAX_HISTORY_CACHE_SIZE = 10000 // Limit the history cache size to prevent memory bloat
+	const activeBufferedTimers = new Set<NodeJS.Timeout>() // Track all active timers from createBufferedFunction
 	const BUFFER_TIMEOUT_MS = 30000 // 30 seconds
+	const CONDITIONAL_CLEANUP_INTERVAL_MS = 60 * 1000 // Cleanup expired conditionals every minute
+	const MAX_BUFFER_SIZE_MESSAGES = 10000 // Maximum number of messages before forcing flush
+	const MAX_BUFFER_SIZE_CHATS = 5000 // Maximum number of chats before forcing flush
+	const MAX_BUFFER_SIZE_CONTACTS = 5000 // Maximum number of contacts before forcing flush
 
 	// take the generic event and fire it as a baileys event
 	ev.on('event', (map: BaileysEventData) => {
@@ -84,6 +103,113 @@ export const makeEventBuffer = (logger: ILogger): BaileysBufferableEventEmitter 
 			ev.emit(event, map[event as keyof BaileysEventMap])
 		}
 	})
+
+	// Periodic cleanup of expired conditional updates
+	const startConditionalCleanup = () => {
+		if (conditionalCleanupTimer) {
+			clearInterval(conditionalCleanupTimer)
+		}
+
+		conditionalCleanupTimer = setInterval(() => {
+			cleanupExpiredConditionalUpdates()
+		}, CONDITIONAL_CLEANUP_INTERVAL_MS)
+	}
+
+	const cleanupExpiredConditionalUpdates = () => {
+		const now = Date.now()
+		let expiredCount = 0
+		const chatUpdates = Object.keys(data.chatUpdates)
+
+		for (const chatId of chatUpdates) {
+			const update = data.chatUpdates[chatId]
+			if (update?.conditional && update.timestamp) {
+				const isExpired = now - update.timestamp > CONDITIONAL_UPDATE_TIMEOUT_MS
+				if (isExpired) {
+					logger.debug({ chatId }, 'Cleaning up expired conditional chat update during periodic cleanup')
+					delete data.chatUpdates[chatId]
+					expiredCount++
+				}
+			}
+		}
+
+		if (expiredCount > 0) {
+			logger.debug({ expiredCount }, 'Cleaned up expired conditional updates')
+		}
+	}
+
+	// Start periodic cleanup
+	startConditionalCleanup()
+
+	// Calculate buffer size
+	const getBufferSize = (): { messages: number; chats: number; contacts: number; total: number } => {
+		const messages =
+			Object.keys(data.historySets.messages).length +
+			Object.keys(data.messageUpserts).length +
+			Object.keys(data.messageUpdates).length +
+			Object.keys(data.messageDeletes).length +
+			Object.keys(data.messageReactions).length +
+			Object.keys(data.messageReceipts).length
+
+		const chats =
+			Object.keys(data.historySets.chats).length +
+			Object.keys(data.chatUpserts).length +
+			Object.keys(data.chatUpdates).length +
+			data.chatDeletes.size
+
+		const contacts =
+			Object.keys(data.historySets.contacts).length +
+			Object.keys(data.contactUpserts).length +
+			Object.keys(data.contactUpdates).length
+
+		return {
+			messages,
+			chats,
+			contacts,
+			total: messages + chats + contacts
+		}
+	}
+
+	// Check if buffer size exceeds limits and force flush if necessary
+	const checkBufferSize = () => {
+		const size = getBufferSize()
+		let shouldFlush = false
+		const reasons: string[] = []
+
+		if (size.messages >= MAX_BUFFER_SIZE_MESSAGES) {
+			shouldFlush = true
+			reasons.push(`messages (${size.messages} >= ${MAX_BUFFER_SIZE_MESSAGES})`)
+		}
+
+		if (size.chats >= MAX_BUFFER_SIZE_CHATS) {
+			shouldFlush = true
+			reasons.push(`chats (${size.chats} >= ${MAX_BUFFER_SIZE_CHATS})`)
+		}
+
+		if (size.contacts >= MAX_BUFFER_SIZE_CONTACTS) {
+			shouldFlush = true
+			reasons.push(`contacts (${size.contacts} >= ${MAX_BUFFER_SIZE_CONTACTS})`)
+		}
+
+		if (shouldFlush) {
+			logger.warn({ bufferSize: size, reasons: reasons.join(', ') }, 'Buffer size limit exceeded, forcing flush')
+			flush()
+		} else if (size.total > 0 && size.total % 1000 === 0) {
+			// Log progress every 1000 items to help monitor buffer growth
+			logger.debug({ bufferSize: size }, 'Buffer size check')
+		}
+	}
+
+	// Clear all active timers from createBufferedFunction
+	const clearAllBufferedTimers = () => {
+		if (activeBufferedTimers.size > 0) {
+			logger.debug({ timerCount: activeBufferedTimers.size }, 'Clearing active buffered function timers')
+			for (const timer of activeBufferedTimers) {
+				clearTimeout(timer)
+			}
+
+			activeBufferedTimers.clear()
+		}
+	}
 
 	function buffer() {
 		if (!isBuffering) {
@@ -95,6 +221,9 @@ export const makeEventBuffer = (logger: ILogger): BaileysBufferableEventEmitter 
 			if (bufferTimeout) {
 				clearTimeout(bufferTimeout)
 			}
+
+			// Clear any existing buffered function timers when starting new buffer
+			clearAllBufferedTimers()
 
 			bufferTimeout = setTimeout(() => {
 				if (isBuffering) {
@@ -122,17 +251,29 @@ export const makeEventBuffer = (logger: ILogger): BaileysBufferableEventEmitter 
 			bufferTimeout = null
 		}
 
-		// Clear history cache if it exceeds the max size
-		if (historyCache.size > MAX_HISTORY_CACHE_SIZE) {
-			logger.debug({ cacheSize: historyCache.size }, 'Clearing history cache')
-			historyCache.clear()
-		}
+		// Clear all active buffered function timers
+		clearAllBufferedTimers()
+
+		// Cleanup expired conditionals during flush as well
+		cleanupExpiredConditionalUpdates()
 
 		const newData = makeBufferData()
 		const chatUpdates = Object.values(data.chatUpdates)
 		let conditionalChatUpdatesLeft = 0
+		const now = Date.now()
+
 		for (const update of chatUpdates) {
 			if (update.conditional) {
+				// Check if conditional update has expired
+				const updateTimestamp = update.timestamp || 0
+				const isExpired = now - updateTimestamp > CONDITIONAL_UPDATE_TIMEOUT_MS
+
+				if (isExpired) {
+					logger.debug({ chatId: update.id }, 'Removing expired conditional chat update')
+					delete data.chatUpdates[update.id!]
+					continue
+				}
+
 				conditionalChatUpdatesLeft += 1
 				newData.chatUpdates[update.id!] = update
 				delete data.chatUpdates[update.id!]
@@ -165,6 +306,8 @@ export const makeEventBuffer = (logger: ILogger): BaileysBufferableEventEmitter 
 		emit<T extends BaileysEvent>(event: BaileysEvent, evData: BaileysEventMap[T]) {
 			if (isBuffering && BUFFERABLE_EVENT_SET.has(event)) {
 				append(data, historyCache, event as BufferableEvent, evData, logger)
+				// Check buffer size after appending to prevent excessive growth
+				checkBufferSize()
 				return true
 			}
 
@@ -182,11 +325,13 @@ export const makeEventBuffer = (logger: ILogger): BaileysBufferableEventEmitter 
 					const result = await work(...args)
 					// If this is the only buffer, flush after a small delay
 					if (bufferCount === 1) {
-						setTimeout(() => {
+						const timer = setTimeout(() => {
+							activeBufferedTimers.delete(timer)
 							if (isBuffering && bufferCount === 1) {
 								flush()
 							}
 						}, 100) // Small delay to allow nested buffers
+						activeBufferedTimers.add(timer)
 					}
 
 					return result
@@ -196,7 +341,11 @@ export const makeEventBuffer = (logger: ILogger): BaileysBufferableEventEmitter 
 					bufferCount = Math.max(0, bufferCount - 1)
 					if (bufferCount === 0) {
 						// Auto-flush when no other buffers are active
-						setTimeout(flush, 100)
+						const timer = setTimeout(() => {
+							activeBufferedTimers.delete(timer)
+							flush()
+						}, 100)
+						activeBufferedTimers.add(timer)
 					}
 				}
 			}
@@ -230,9 +379,67 @@ const makeBufferData = (): BufferedEventData => {
 	}
 }
 
+// Remove oldest conditional update if limit is reached
+function handleConditionalUpdateLimit(data: BufferedEventData, chatId: string, logger: ILogger) {
+	const conditionalCount = Object.values(data.chatUpdates).filter(u => u?.conditional).length
+	if (conditionalCount < MAX_CONDITIONAL_UPDATES) {
+		return
+	}
+
+	logger.warn({ chatId, conditionalCount }, 'Maximum conditional updates reached, removing oldest pending update')
+
+	// Find oldest conditional update
+	let oldestId: string | undefined
+	let oldestTimestamp = Infinity
+	for (const [id, upd] of Object.entries(data.chatUpdates)) {
+		if (!upd?.conditional) {
+			continue
+		}
+
+		const ts = upd.timestamp || 0
+		if (ts < oldestTimestamp) {
+			oldestTimestamp = ts
+			oldestId = id
+		}
+	}
+
+	if (oldestId) {
+		delete data.chatUpdates[oldestId]
+		logger.debug({ removedChatId: oldestId }, 'Removed oldest conditional update to make room')
+	}
+}
+
+function absorbingChatUpdate(existing: Chat, data: BufferedEventData, logger: ILogger) {
+	const chatId = existing.id || ''
+	const update = data.chatUpdates[chatId]
+	if (update) {
+		// Check if update has expired before processing
+		if (update.conditional && update.timestamp) {
+			const now = Date.now()
+			const isExpired = now - update.timestamp > CONDITIONAL_UPDATE_TIMEOUT_MS
+			if (isExpired) {
+				logger.debug({ chatId }, 'Skipping expired conditional update during absorption')
+				delete data.chatUpdates[chatId]
+				return
+			}
+		}
+
+		const conditionMatches = update.conditional ? update.conditional(data) : true
+		if (conditionMatches) {
+			delete update.conditional
+			logger.debug({ chatId }, 'absorbed chat update in existing chat')
+			Object.assign(existing, concatChats(update as Chat, existing))
+			delete data.chatUpdates[chatId]
+		} else if (conditionMatches === false) {
+			logger.debug({ chatId }, 'chat update condition fail, removing')
+			delete data.chatUpdates[chatId]
+		}
+	}
+}
+
 function append<E extends BufferableEvent>(
 	data: BufferedEventData,
-	historyCache: Set<string>,
+	historyCache: LRUCache<string, boolean>,
 	event: E,
 	// eslint-disable-next-line @typescript-eslint/no-explicit-any
 	eventData: any,
@@ -249,9 +456,9 @@ function append<E extends BufferableEvent>(
 
 				if (!existingChat && !historyCache.has(id)) {
 					data.historySets.chats[id] = chat
-					historyCache.add(id)
+					historyCache.set(id, true)
 
-					absorbingChatUpdate(chat)
+					absorbingChatUpdate(chat, data, logger)
 				}
 			}
 
@@ -264,7 +471,7 @@ function append<E extends BufferableEvent>(
 					const hasAnyName = contact.notify || contact.name || contact.verifiedName
 					if (!historyCache.has(historyContactId) || hasAnyName) {
 						data.historySets.contacts[contact.id] = contact
-						historyCache.add(historyContactId)
+						historyCache.set(historyContactId, true)
 					}
 				}
 			}
@@ -274,7 +481,7 @@ function append<E extends BufferableEvent>(
 				const existingMsg = data.historySets.messages[key]
 				if (!existingMsg && !historyCache.has(key)) {
 					data.historySets.messages[key] = message
-					historyCache.add(key)
+					historyCache.set(key, true)
 				}
 			}
 
@@ -303,7 +510,7 @@ function append<E extends BufferableEvent>(
 					data.chatUpserts[id] = upsert
 				}
 
-				absorbingChatUpdate(upsert)
+				absorbingChatUpdate(upsert, data, logger)
 
 				if (data.chatDeletes.has(id)) {
 					data.chatDeletes.delete(id)
@@ -329,6 +536,13 @@ function append<E extends BufferableEvent>(
 					}
 				} else if (conditionMatches === undefined) {
 					// condition yet to be fulfilled
+					handleConditionalUpdateLimit(data, chatId, logger)
+
+					// Add timestamp to track expiration
+					if (!update.timestamp) {
+						update.timestamp = Date.now()
+					}
+
 					data.chatUpdates[chatId] = update
 				}
 				// otherwise -- condition not met, update is invalid
@@ -520,23 +734,6 @@ function append<E extends BufferableEvent>(
 			break
 		default:
 			throw new Error(`"${event}" cannot be buffered`)
-	}
-
-	function absorbingChatUpdate(existing: Chat) {
-		const chatId = existing.id || ''
-		const update = data.chatUpdates[chatId]
-		if (update) {
-			const conditionMatches = update.conditional ? update.conditional(data) : true
-			if (conditionMatches) {
-				delete update.conditional
-				logger.debug({ chatId }, 'absorbed chat update in existing chat')
-				Object.assign(existing, concatChats(update as Chat, existing))
-				delete data.chatUpdates[chatId]
-			} else if (conditionMatches === false) {
-				logger.debug({ chatId }, 'chat update condition fail, removing')
-				delete data.chatUpdates[chatId]
-			}
-		}
 	}
 
 	function decrementChatReadCounterIfMsgDidUnread(message: WAMessage) {

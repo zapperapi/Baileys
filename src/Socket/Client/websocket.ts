@@ -31,7 +31,9 @@ export class WebSocketClient extends AbstractSocketClient {
 			agent: this.config.agent
 		})
 
-		this.socket.setMaxListeners(0)
+		// Set max listeners to detect memory leaks from accumulating event listeners
+		// 100 is reasonable for WebSocket which has multiple event types (open, close, error, message, etc.)
+		this.socket.setMaxListeners(100)
 
 		const events = ['close', 'error', 'upgrade', 'message', 'open', 'ping', 'pong', 'unexpected-response']
 
