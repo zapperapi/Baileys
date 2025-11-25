@@ -3010,7 +3010,7 @@ __metadata:
     typedoc: "npm:^0.27.9"
     typedoc-plugin-markdown: "npm:4.4.2"
     typescript: "npm:^5.8.2"
-    whatsapp-rust-bridge: "npm:^0.4.0-alpha.4"
+    whatsapp-rust-bridge: "npm:^0.4.1"
     ws: "npm:^8.13.0"
   peerDependencies:
     audio-decode: ^2.1.3
@@ -10122,10 +10122,10 @@ __metadata:
   languageName: node
   linkType: hard
 
-"whatsapp-rust-bridge@npm:^0.4.0-alpha.4":
-  version: 0.4.0-alpha.4
-  resolution: "whatsapp-rust-bridge@npm:0.4.0-alpha.4"
-  checksum: 10c0/10cd3e8d41595a74dc25d2e10aea5b3408905030d07458e0dc11746676785c8fbd3530da7508d0934e67c471cb35175f5ead2217e945e4498c5f0f95f61d2a77
+"whatsapp-rust-bridge@npm:^0.4.1":
+  version: 0.4.1
+  resolution: "whatsapp-rust-bridge@npm:0.4.1"
+  checksum: 10c0/094dcdae79eeaecab23af1da5b8b39e4d55fae78f804b72aefc4886382d532a6afa83de722ceacacdeeeaec8a657a8f3d2aa3e34d804524b23206bd884563fe9
   languageName: node
   linkType: hard
 
